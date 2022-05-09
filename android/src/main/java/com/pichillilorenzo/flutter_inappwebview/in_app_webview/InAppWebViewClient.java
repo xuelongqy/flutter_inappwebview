@@ -5,6 +5,7 @@ import android.graphics.Bitmap;
 import android.net.http.SslError;
 import android.os.Build;
 import android.os.Message;
+import android.text.TextUtils;
 import android.util.Log;
 import android.view.KeyEvent;
 import android.webkit.ClientCertRequest;
@@ -37,17 +38,31 @@ import com.pichillilorenzo.flutter_inappwebview.types.ServerTrustChallenge;
 import com.pichillilorenzo.flutter_inappwebview.types.URLCredential;
 import com.pichillilorenzo.flutter_inappwebview.types.URLProtectionSpace;
 import com.pichillilorenzo.flutter_inappwebview.types.URLRequest;
+import com.pichillilorenzo.flutter_inappwebview.types.UserScriptInjectionTime;
 
 import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import io.flutter.plugin.common.MethodChannel;
+import okhttp3.Cookie;
+import okhttp3.CookieJar;
+import okhttp3.Headers;
+import okhttp3.HttpUrl;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
 
 public class InAppWebViewClient extends WebViewClient {
 
@@ -57,11 +72,16 @@ public class InAppWebViewClient extends WebViewClient {
   private static int previousAuthRequestFailureCount = 0;
   private static List<URLCredential> credentialsProposed = null;
 
+  public OkHttpClient httpClient;
+
   public InAppWebViewClient(MethodChannel channel, InAppBrowserDelegate inAppBrowserDelegate) {
     super();
 
     this.channel = channel;
     this.inAppBrowserDelegate = inAppBrowserDelegate;
+    httpClient = new OkHttpClient.Builder()
+            .cookieJar(new WebViewCookieJar())
+            .build();
   }
 
   @TargetApi(Build.VERSION_CODES.LOLLIPOP)
@@ -162,6 +182,170 @@ public class InAppWebViewClient extends WebViewClient {
         allowShouldOverrideUrlLoading(webView, url, headers, isForMainFrame);
       }
     });
+  }
+
+  // Replace loadCustomJavaScriptOnPageStarted
+  public WebResourceResponse injectJavaScriptOnIntercept(WebView view, WebResourceRequest request, WebResourceResponse response) {
+    InAppWebView webView = (InAppWebView) view;
+    if (webView.userContentController.getUserOnlyScriptsAt(UserScriptInjectionTime.AT_DOCUMENT_START).isEmpty()) {
+      return null;
+    }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+      String url = request.getUrl().toString();
+      if (!request.getMethod().equalsIgnoreCase("GET")
+              || !request.isForMainFrame()
+              || url.contains(".js")
+              || url.contains(".json")
+              || url.contains(".css")) {
+        return response;
+      }
+      Log.d(LOG_TAG, "start inject " + request.getUrl());
+      try {
+        String source = webView.userContentController.generateUserOnlyScriptsCodeAt(UserScriptInjectionTime.AT_DOCUMENT_START);
+        if (!source.isEmpty()) {
+          WebResourceResponse mResponse = response;
+          if (mResponse == null) {
+            mResponse = requestUrl(request);
+          }
+          if (mResponse == null) {
+            return null;
+          }
+          Log.d(LOG_TAG, "injecting " + request.getUrl());
+          InputStream inputStream = mResponse.getData();
+          byte[] bytes = new byte[inputStream.available()];
+          inputStream.read(bytes);
+          String html = new String(bytes);
+          if (!TextUtils.isEmpty(html)) {
+            String script = "<script>" + source + "</script>";
+            int position = getInjectionPosition(html);
+            if (position >= 0) {
+              String beforeTag = html.substring(0, position);
+              String afterTab = html.substring(position);
+              html = beforeTag + script + afterTab;
+              mResponse.setData(new ByteArrayInputStream(html.getBytes()));
+              Log.d(LOG_TAG, "inject success " + request.getUrl());
+            }
+          }
+          return mResponse;
+        }
+        return response;
+      } catch (Exception e) {
+        Log.e(LOG_TAG, "inject error " + request.getUrl());
+        e.printStackTrace();
+        return response;
+      }
+    }
+    return response;
+  }
+
+  private int getInjectionPosition(String body) {
+    body = body.toLowerCase();
+    int ieDetectTagIndex = body.indexOf("<!--[if");
+    int scriptTagIndex = body.indexOf("<script");
+
+    int index;
+    if (ieDetectTagIndex < 0) {
+      index = scriptTagIndex;
+    } else {
+      index = Math.min(scriptTagIndex, ieDetectTagIndex);
+    }
+    if (index < 0) {
+      index = body.indexOf("</head");
+    }
+    if (index < 0) {
+      index = 0; //just wrap whole view
+    }
+    return index;
+  }
+
+  private WebResourceResponse requestUrl(WebResourceRequest request) {
+    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
+      HttpUrl httpUrl = HttpUrl.parse(request.getUrl().toString());
+      if (httpUrl == null) {
+        return null;
+      }
+      Request.Builder requestBuilder = new Request.Builder()
+              .get()
+              .url(httpUrl);
+      Map<String, String> headers = request.getRequestHeaders();
+      Set<String> keys = headers.keySet();
+      for (String key : keys) {
+        requestBuilder.addHeader(key, headers.get(key));
+      }
+      Request okRequest = requestBuilder.build();
+      try {
+        Response okResponse = httpClient.newCall(okRequest).execute();
+        Response prior = okResponse.priorResponse();
+        boolean isRedirect = prior != null && prior.isRedirect();
+        if (isRedirect) {
+          return  null;
+        }
+        String contentTypeAndCharset = okResponse.header("content-type", "application/octet-stream");
+        if (!contentTypeAndCharset.toLowerCase().startsWith("text/html")) {
+          return null;
+        }
+        String contentType = getContentTypeHeader(okResponse);
+        String mime = getMimeType(contentType);
+        String charset = getCharset(contentType);
+        HashMap<String, String> resHeaders = new HashMap<>();
+        Map<String, List<String>> okHeaders = okResponse.headers().toMultimap();
+        for (Map.Entry<String, List<String>> entry : okHeaders.entrySet()) {
+          resHeaders.put(entry.getKey(), entry.getValue().get(0));
+        }
+        String reasonPhrase = "OK";
+        if (!okResponse.message().isEmpty()) {
+          reasonPhrase = okResponse.message();
+        }
+        return new WebResourceResponse(
+                mime,
+                charset,
+                okResponse.code(),
+                reasonPhrase,
+                resHeaders,
+                new ByteArrayInputStream(okResponse.body().bytes())
+        );
+      } catch (IOException e) {
+        e.printStackTrace();
+      }
+    }
+    return null;
+  }
+
+  @Nullable
+  private String getContentTypeHeader(Response response) {
+    Headers headers = response.headers();
+    String contentType;
+    if (TextUtils.isEmpty(headers.get("Content-Type"))) {
+      if (TextUtils.isEmpty(headers.get("content-Type"))) {
+        contentType = "text/data; charset=utf-8";
+      } else {
+        contentType = headers.get("content-Type");
+      }
+    } else {
+      contentType = headers.get("Content-Type");
+    }
+    if (contentType != null) {
+      contentType = contentType.trim();
+    }
+    return contentType;
+  }
+
+  private String getMimeType(String contentType) {
+    Matcher regexResult = Pattern.compile("^.*(?=;)").matcher(contentType);
+    if (regexResult.find()) {
+      return regexResult.group();
+    }
+    return "text/html";
+  }
+
+  private String getCharset(String contentType) {
+    Matcher regexResult = Pattern.compile("charset=([a-zA-Z0-9-]+)").matcher(contentType);
+    if (regexResult.find()) {
+      if (regexResult.groupCount() >= 2) {
+        return regexResult.group(1);
+      }
+    }
+    return "utf-8";
   }
 
   public void loadCustomJavaScriptOnPageStarted(WebView view) {
@@ -674,10 +858,10 @@ public class InAppWebViewClient extends WebViewClient {
 
     if (webView.options.useShouldInterceptRequest) {
       WebResourceResponse onShouldInterceptResponse = onShouldInterceptRequest(request);
-      return onShouldInterceptResponse;
+      return injectJavaScriptOnIntercept(view, request, onShouldInterceptResponse);
     }
 
-    return shouldInterceptRequest(view, url);
+    return injectJavaScriptOnIntercept(view, request, shouldInterceptRequest(view, url));
   }
 
   public WebResourceResponse onShouldInterceptRequest(Object request) {
@@ -827,5 +1011,44 @@ public class InAppWebViewClient extends WebViewClient {
     if (inAppBrowserDelegate != null) {
       inAppBrowserDelegate = null;
     }
+  }
+}
+
+class WebViewCookieJar implements CookieJar {
+  private CookieManager webViewCookieManager;
+
+  public WebViewCookieJar() {
+    try {
+      webViewCookieManager = CookieManager.getInstance();
+    } catch (Exception ex) {
+      /* Caused by android.content.pm.PackageManager$NameNotFoundException com.google.android.webview */
+    }
+  }
+
+  @Override
+  public void saveFromResponse(@NonNull HttpUrl url, @NonNull List<Cookie> cookies) {
+    if (webViewCookieManager != null) {
+      String urlString = url.toString();
+      for (Cookie cookie : cookies) {
+        webViewCookieManager.setCookie(urlString, cookie.toString());
+      }
+    }
+  }
+
+  @Override
+  public List<Cookie> loadForRequest(@NonNull HttpUrl url) {
+    if (webViewCookieManager != null) {
+      String urlString = url.toString();
+      String cookiesString = webViewCookieManager.getCookie(urlString);
+      if (cookiesString != null && !TextUtils.isEmpty(cookiesString)) {
+        String[] cookieHeaders = cookiesString.split(";");
+        List<Cookie> cookies = new ArrayList<>();
+        for (String cookieHeader : cookieHeaders) {
+          cookies.add(Cookie.parse(url, cookieHeader));
+        }
+        return cookies;
+      }
+    }
+    return Collections.emptyList();
   }
 }
